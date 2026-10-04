@@ -35,4 +35,12 @@ var (
 
 	// ErrEmptyPlaintext 不允许加密空明文。
 	ErrEmptyPlaintext = errors.New("envelope: empty plaintext")
+
+	// ErrContextMismatch 解密时提供的上下文标识与密文封装时绑定的上下文不一致。
+	// 该结论与“密文被篡改”（ErrCiphertextModified）明确区分：
+	// 密文本身完整有效，只是调用方未持有正确的上下文。
+	ErrContextMismatch = errors.New("envelope: context mismatch")
+
+	// ErrContextTooLarge 调用方提供的上下文标识超出格式允许的最大长度。
+	ErrContextTooLarge = errors.New("envelope: context identifier too large")
 )

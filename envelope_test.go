@@ -10,21 +10,35 @@ import (
 	"time"
 )
 
-// sealVersion 复刻 Seal 的两步封装，但允许测试指定线格式版本，
+// sealVersion 复刻 Seal 的两步封装，但允许测试指定线格式版本（v1/v2），
 // 用于模拟“历史版本密文仍可被读取”与“同一密钥环下新旧格式混用”。
+// AAD 严格按版本选择独立域，与生产 Open 路径的版本分派保持一致。
 func sealVersion(t *testing.T, entry *keyEntry, plaintext []byte, version byte, ts int64) []byte {
 	t.Helper()
+
+	var wrapAAD, payloadAAD []byte
+	switch version {
+	case FormatV1:
+		wrapAAD = buildKeyIDAAD(aadDEKWrapV1, entry.id)
+		payloadAAD = buildKeyIDAAD(aadPayloadV1, entry.id)
+	case FormatV2:
+		wrapAAD = buildKeyIDAAD(aadDEKWrapV2, entry.id)
+		payloadAAD = buildKeyIDAAD(aadPayloadV2, entry.id)
+	default:
+		t.Fatalf("sealVersion 仅支持 v1/v2 历史构造, got v%d", version)
+	}
+
 	dek := testKey("dek:" + entry.id + ":" + fmt.Sprint(ts))
 
 	wrapNonce := bytes.Repeat([]byte{0x11}, wrapNonceSize)
-	sealedDEK, err := gcmSeal(entry.key, wrapNonce, dek, buildWrapAAD(entry.id))
+	sealedDEK, err := gcmSeal(entry.key, wrapNonce, dek, wrapAAD)
 	if err != nil {
 		t.Fatalf("gcmSeal DEK: %v", err)
 	}
 	encDEK := append(append([]byte{}, wrapNonce...), sealedDEK...)
 
 	payloadNonce := bytes.Repeat([]byte{0x22}, gcmStandardNonceSize)
-	ct, err := gcmSeal(dek, payloadNonce, plaintext, buildPayloadAAD(entry.id))
+	ct, err := gcmSeal(dek, payloadNonce, plaintext, payloadAAD)
 	if err != nil {
 		t.Fatalf("gcmSeal payload: %v", err)
 	}
@@ -40,6 +54,16 @@ func sealVersion(t *testing.T, entry *keyEntry, plaintext []byte, version byte, 
 	return encode(env)
 }
 
+// sealV3 使用与生产完全相同的封装流程构造 v3 密文，并可指定上下文标识。
+func sealV3(t *testing.T, entry *keyEntry, plaintext, context []byte, ts int64) []byte {
+	t.Helper()
+	raw, err := sealEnvelope(entry.key, entry.id, plaintext, append([]byte{}, context...), ts)
+	if err != nil {
+		t.Fatalf("sealEnvelope v3: %v", err)
+	}
+	return raw
+}
+
 func TestSealOpenRoundtrip(t *testing.T) {
 	ring := NewKeyRing()
 	if err := ring.AddKey("k1", testKey("one"), true); err != nil {
@@ -52,8 +76,11 @@ func TestSealOpenRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	t.Logf("输入=%q | 密文长度=%d 字节, 版本字节=0x%02x | 判定依据=新密文使用当前格式 v2",
+	t.Logf("输入=%q | 密文长度=%d 字节, 版本字节=0x%02x | 判定依据=新密文使用当前格式 v3",
 		plaintext, len(ct), ct[magicSize])
+	if ct[magicSize] != FormatV3 {
+		t.Fatalf("新密文默认应为 v3(0x%02x), got 0x%02x", FormatV3, ct[magicSize])
+	}
 
 	got, err := svc.Open(ct)
 	if err != nil {
@@ -83,8 +110,8 @@ func TestSealRejectsBadInputs(t *testing.T) {
 	t.Logf("输入=Seal(nil) | 判定依据=%v", ErrEmptyPlaintext)
 }
 
-// TestFormatEvolutionV1AndV2Mix：v1 历史密文与 v2 新密文在同一密钥环混用。
-func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
+// TestFormatEvolutionV1V2V3Mix：v1/v2 历史密文与 v3 新密文在同一密钥环混用。
+func TestFormatEvolutionV1V2V3Mix(t *testing.T) {
 	ring := NewKeyRing()
 	if err := ring.AddKey("k1", testKey("one"), true); err != nil {
 		t.Fatal(err)
@@ -92,18 +119,25 @@ func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
 	k1, _ := ring.lookupByID("k1")
 	svc := NewEnvelopeService(ring)
 
-	// 历史遗留：一条 v1 密文。
-	oldPT := []byte("legacy-v1-payload")
-	v1ct := sealVersion(t, k1, oldPT, FormatV1, 0)
-	// 新写入：由当前代码 Seal 产生，必须为 v2。
-	newPT := []byte("modern-v2-payload")
-	v2ct, err := svc.Seal(newPT)
+	// 历史遗留：一条 v1、一条 v2 密文。
+	oldV1PT := []byte("legacy-v1-payload")
+	v1ct := sealVersion(t, k1, oldV1PT, FormatV1, 0)
+	oldV2PT := []byte("legacy-v2-payload")
+	v2ct := sealVersion(t, k1, oldV2PT, FormatV2, 1)
+	// 新写入：由当前代码 SealWithContext 产生，必须为 v3 并绑定上下文。
+	newPT := []byte("modern-v3-payload")
+	v3ctx := []byte("tenant-a/billing")
+	v3ct, err := svc.SealWithContext(newPT, v3ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Logf("输入=历史密文 版本=0x%02x 长度=%d | 新密文 版本=0x%02x 长度=%d",
-		v1ct[magicSize], len(v1ct), v2ct[magicSize], len(v2ct))
+	t.Logf("输入=历史密文 v1=0x%02x(%dB) v2=0x%02x(%dB) | 新密文 v3=0x%02x(%dB, ctx=%q)",
+		v1ct[magicSize], len(v1ct), v2ct[magicSize], len(v2ct),
+		v3ct[magicSize], len(v3ct), v3ctx)
+	if v3ct[magicSize] != FormatV3 {
+		t.Fatalf("新写入密文必须为 v3, got 0x%02x", v3ct[magicSize])
+	}
 
 	got1, err := svc.Open(v1ct)
 	if err != nil {
@@ -111,20 +145,30 @@ func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
 	}
 	got2, err := svc.Open(v2ct)
 	if err != nil {
-		t.Fatalf("v2 新密文应可读取, got %v", err)
+		t.Fatalf("v2 历史密文应可读取, got %v", err)
 	}
-	if !bytes.Equal(got1, oldPT) || !bytes.Equal(got2, newPT) {
-		t.Fatalf("新旧格式混用解密结果不符: %q / %q", got1, got2)
+	got3, err := svc.OpenWithContext(v3ct, v3ctx)
+	if err != nil {
+		t.Fatalf("v3 新密文在正确上下文下应可读取, got %v", err)
 	}
-	t.Logf("判定依据=按版本字节分派解析器: v1->%q, v2->%q；同一密钥环可混合使用", got1, got2)
+	if !bytes.Equal(got1, oldV1PT) || !bytes.Equal(got2, oldV2PT) || !bytes.Equal(got3, newPT) {
+		t.Fatalf("三代格式混用解密结果不符: %q / %q / %q", got1, got2, got3)
+	}
+	t.Logf("判定依据=按版本字节分派解析器与 AAD 域: v1->%q, v2->%q, v3->%q", got1, got2, got3)
+
+	// v1/v2 不含上下文：带着非空上下文去开历史密文必须被拒绝。
+	if _, err := svc.OpenWithContext(v2ct, []byte("tenant-a/billing")); !errors.Is(err, ErrContextMismatch) {
+		t.Fatalf("v2 历史密文不接受上下文绑定, 期望 ErrContextMismatch, got %v", err)
+	}
+	t.Logf("输入=携带上下文打开 v2 密文 | 判定依据=%v（历史密文上下文为空）", ErrContextMismatch)
 
 	// 无法识别的版本：必须明确拒绝，不得按当前格式误解析。
-	bogus := append([]byte{}, v2ct...)
+	bogus := append([]byte{}, v3ct...)
 	bogus[magicSize] = 0x7F
 	if _, err := svc.Open(bogus); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("input=<version 0x7F> 期望 ErrUnsupportedVersion, got %v", err)
 	}
-	t.Logf("输入=篡改版本字节为 0x7F | 判定依据=%v（拒绝按当前格式猜测解析）", ErrUnsupportedVersion)
+	t.Logf("输入=篡改 v3 版本字节为 0x7F | 判定依据=%v（拒绝按当前格式猜测解析）", ErrUnsupportedVersion)
 }
 
 // TestOpenUnknownKey 永不回退：密文指向密钥环中不存在的密钥。
