@@ -35,4 +35,9 @@ var (
 
 	// ErrEmptyPlaintext 不允许加密空明文。
 	ErrEmptyPlaintext = errors.New("envelope: empty plaintext")
+
+	// ErrContextMismatch 解密时提供的加密上下文与加密时绑定的上下文不一致。
+	// 与 ErrCiphertextModified 明确区分：前者是“调用方拿错了上下文”，
+	// 后者是“密文字节本身被改动”。
+	ErrContextMismatch = errors.New("envelope: encryption context mismatch")
 )

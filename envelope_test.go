@@ -17,14 +17,14 @@ func sealVersion(t *testing.T, entry *keyEntry, plaintext []byte, version byte, 
 	dek := testKey("dek:" + entry.id + ":" + fmt.Sprint(ts))
 
 	wrapNonce := bytes.Repeat([]byte{0x11}, wrapNonceSize)
-	sealedDEK, err := gcmSeal(entry.key, wrapNonce, dek, buildWrapAAD(entry.id))
+	sealedDEK, err := gcmSeal(entry.key, wrapNonce, dek, buildWrapAAD(version, entry.id))
 	if err != nil {
 		t.Fatalf("gcmSeal DEK: %v", err)
 	}
 	encDEK := append(append([]byte{}, wrapNonce...), sealedDEK...)
 
 	payloadNonce := bytes.Repeat([]byte{0x22}, gcmStandardNonceSize)
-	ct, err := gcmSeal(dek, payloadNonce, plaintext, buildPayloadAAD(entry.id))
+	ct, err := gcmSeal(dek, payloadNonce, plaintext, buildPayloadAAD(version, entry.id))
 	if err != nil {
 		t.Fatalf("gcmSeal payload: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestSealOpenRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	t.Logf("输入=%q | 密文长度=%d 字节, 版本字节=0x%02x | 判定依据=新密文使用当前格式 v2",
+	t.Logf("输入=%q | 密文长度=%d 字节, 版本字节=0x%02x | 判定依据=新密文使用当前格式 v3",
 		plaintext, len(ct), ct[magicSize])
 
 	got, err := svc.Open(ct)
@@ -83,8 +83,8 @@ func TestSealRejectsBadInputs(t *testing.T) {
 	t.Logf("输入=Seal(nil) | 判定依据=%v", ErrEmptyPlaintext)
 }
 
-// TestFormatEvolutionV1AndV2Mix：v1 历史密文与 v2 新密文在同一密钥环混用。
-func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
+// TestFormatEvolutionMixedVersions：v1/v2 历史密文与 v3 新密文在同一密钥环混用。
+func TestFormatEvolutionMixedVersions(t *testing.T) {
 	ring := NewKeyRing()
 	if err := ring.AddKey("k1", testKey("one"), true); err != nil {
 		t.Fatal(err)
@@ -92,18 +92,23 @@ func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
 	k1, _ := ring.lookupByID("k1")
 	svc := NewEnvelopeService(ring)
 
-	// 历史遗留：一条 v1 密文。
-	oldPT := []byte("legacy-v1-payload")
-	v1ct := sealVersion(t, k1, oldPT, FormatV1, 0)
-	// 新写入：由当前代码 Seal 产生，必须为 v2。
-	newPT := []byte("modern-v2-payload")
-	v2ct, err := svc.Seal(newPT)
+	// 历史遗留：v1、v2 密文各一条。
+	oldPT1 := []byte("legacy-v1-payload")
+	v1ct := sealVersion(t, k1, oldPT1, FormatV1, 0)
+	oldPT2 := []byte("legacy-v2-payload")
+	v2ct := sealVersion(t, k1, oldPT2, FormatV2, 7)
+	// 新写入：由当前代码 Seal 产生，必须为 v3。
+	newPT := []byte("modern-v3-payload")
+	v3ct, err := svc.Seal(newPT)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if v3ct[magicSize] != FormatV3 {
+		t.Fatalf("新密文应使用当前格式 v3, got 0x%02x", v3ct[magicSize])
+	}
 
-	t.Logf("输入=历史密文 版本=0x%02x 长度=%d | 新密文 版本=0x%02x 长度=%d",
-		v1ct[magicSize], len(v1ct), v2ct[magicSize], len(v2ct))
+	t.Logf("输入=历史密文 v1(0x%02x,%dB) v2(0x%02x,%dB) | 新密文 v3(0x%02x,%dB)",
+		v1ct[magicSize], len(v1ct), v2ct[magicSize], len(v2ct), v3ct[magicSize], len(v3ct))
 
 	got1, err := svc.Open(v1ct)
 	if err != nil {
@@ -111,15 +116,20 @@ func TestFormatEvolutionV1AndV2Mix(t *testing.T) {
 	}
 	got2, err := svc.Open(v2ct)
 	if err != nil {
-		t.Fatalf("v2 新密文应可读取, got %v", err)
+		t.Fatalf("v2 历史密文应可读取, got %v", err)
 	}
-	if !bytes.Equal(got1, oldPT) || !bytes.Equal(got2, newPT) {
-		t.Fatalf("新旧格式混用解密结果不符: %q / %q", got1, got2)
+	got3, err := svc.Open(v3ct)
+	if err != nil {
+		t.Fatalf("v3 新密文应可读取, got %v", err)
 	}
-	t.Logf("判定依据=按版本字节分派解析器: v1->%q, v2->%q；同一密钥环可混合使用", got1, got2)
+	if !bytes.Equal(got1, oldPT1) || !bytes.Equal(got2, oldPT2) || !bytes.Equal(got3, newPT) {
+		t.Fatalf("新旧格式混用解密结果不符: %q / %q / %q", got1, got2, got3)
+	}
+	t.Logf("判定依据=按版本字节分派解析器: v1->%q, v2->%q, v3->%q；同一密钥环可混合使用",
+		got1, got2, got3)
 
 	// 无法识别的版本：必须明确拒绝，不得按当前格式误解析。
-	bogus := append([]byte{}, v2ct...)
+	bogus := append([]byte{}, v3ct...)
 	bogus[magicSize] = 0x7F
 	if _, err := svc.Open(bogus); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("input=<version 0x7F> 期望 ErrUnsupportedVersion, got %v", err)
@@ -234,8 +244,8 @@ func TestTamperedCiphertext(t *testing.T) {
 		}
 		// encDEK 位于头部字段之后；翻转其最后一个字节（DEK 的 GCM 标签区）。
 		bad := append([]byte{}, ct...)
-		// 定位 encDEK 起点：魔数4+版本1+标志1+keyID长度2+keyID+dekLen2
-		off := magicSize + 1 + 1 + 2 + len(env.keyID) + 2
+		// 偏移直接取解析期记录的 ENC_DEK 起始位置，避免硬编码布局。
+		off := env.dekOff
 		bad[off+len(env.encDEK)-1] ^= 0x01
 		_, err = svc.Open(bad)
 		t.Logf("输入=encDEK 标签位翻转 偏移=%d | 输出=%v | 判定依据=DEK 解封装验签失败", off, err)
